@@ -3,22 +3,15 @@ import asyncio
 import os
 import sys
 import time
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 
 import config
+from engine import Engine
+from execution import LiveGateway, PaperExchange
 from kraken_api import KrakenAPI
-from kraken_ws import stream_ohlc
-from live_executor import LiveExecutor, run_live_test
-from portfolio import Portfolio
-from sizing import calculate_spend
-from strategy import compute_rsi, generate_signal
+from latency import Metrics
+from market_data import MarketData
+from position import Position
 
-DEMO_INTERVAL_MINUTES = 1
-DEMO_RSI_OVERSOLD = 45
-DEMO_RSI_OVERBOUGHT = 55
-
-HISTORY_LIMIT = 500
 LIVE_COUNTDOWN_SECONDS = 10
 
 
@@ -30,132 +23,98 @@ def confirm_live_trading():
         )
 
 
-async def run(demo=False, live=False):
-    interval_minutes = DEMO_INTERVAL_MINUTES if demo else config.INTERVAL_MINUTES
-    rsi_oversold = DEMO_RSI_OVERSOLD if demo else config.RSI_OVERSOLD
-    rsi_overbought = DEMO_RSI_OVERBOUGHT if demo else config.RSI_OVERBOUGHT
+async def periodic(engine, metrics, interval_s):
+    last_stats = time.monotonic()
+    while True:
+        await asyncio.sleep(1)
+        await engine.check_risk(time.time_ns())
+        print(f"\r{engine.status_line()}   ", end="", flush=True)
+        if time.monotonic() - last_stats >= interval_s:
+            last_stats = time.monotonic()
+            p = engine.position
+            print(f"\n[STATS] fills={p.fills} volume=${p.volume_usd:.2f} fees=${p.fees:.4f}\n{metrics.report()}")
 
+
+async def run(live, record_path):
     api = KrakenAPI()
+    pair_info = api.get_asset_pair_info(config.PAIR)
+    metrics = Metrics()
+    md = MarketData(
+        config.WS_SYMBOL, config.BOOK_DEPTH, pair_info["pair_decimals"],
+        pair_info["lot_decimals"], metrics, record_path,
+    )
 
     if live:
         confirm_live_trading()
-        portfolio = LiveExecutor(
-            api, config.PAIR, config.LIVE_MAX_TRADE_USD, config.LIVE_MAX_LOSS_USD, config.TRADE_LOG_FILE
-        )
+        balances = api.get_balance()
+        cash = balances.get(pair_info["quote"], 0.0)
+        position = Position(cash, config.TRADE_LOG_FILE)
+        gateway = LiveGateway(config, api, config.WS_SYMBOL, metrics, on_fill=None)
         print(
-            f"\n*** LIVE TRADING -- REAL MONEY ***\n"
-            f"Pair: {config.PAIR} | Balance: {portfolio.cash:.2f} {portfolio.quote_asset}, "
-            f"{portfolio.position_qty:.8f} {portfolio.base_asset}\n"
-            f"Caps: max {config.LIVE_MAX_TRADE_USD:.2f} per trade, "
-            f"{config.LIVE_MAX_LOSS_USD:.2f} max realized loss before new buys are blocked.\n"
+            f"\n*** LIVE MARKET MAKING -- REAL MONEY ***\n"
+            f"{config.PAIR} | {cash:.2f} {pair_info['quote']} available | "
+            f"quote size {config.QUOTE_SIZE} | max position {config.MAX_POSITION} | "
+            f"loss limit ${config.MAX_LOSS_USD:.2f}\n"
             f"Starting in {LIVE_COUNTDOWN_SECONDS}s -- Ctrl+C now to abort.\n"
         )
         for remaining in range(LIVE_COUNTDOWN_SECONDS, 0, -1):
             print(f"\r{remaining}...", end="", flush=True)
-            time.sleep(1)
+            await asyncio.sleep(1)
         print()
     else:
-        state_file = "demo_" + config.STATE_FILE if demo else config.STATE_FILE
-        trade_log_file = "demo_" + config.TRADE_LOG_FILE if demo else config.TRADE_LOG_FILE
-        portfolio = Portfolio(config.STARTING_CASH, state_file, trade_log_file)
+        position = Position(config.STARTING_CASH, "paper_" + config.TRADE_LOG_FILE)
+        gateway = PaperExchange(config, md.book, on_fill=None)
+        print(
+            f"Paper market making {config.PAIR} | simulated order latency {config.SIM_LATENCY_MS}ms | "
+            f"maker fee {config.MAKER_FEE * 1e4:.1f}bp\nNo real orders will be placed. Ctrl+C to stop.\n"
+        )
 
-    # One-time REST call to seed RSI history. WebSocket snapshots only cover
-    # recent trades and can have gaps on a low-volume pair, so this guarantees
-    # enough contiguous candles before switching to WebSocket-only updates.
-    candles = api.get_ohlc(config.PAIR, interval_minutes)
-    closes = [float(c[4]) for c in candles]
+    engine = Engine(config, md.book, gateway, position, metrics, pair_info)
+    gateway.on_fill = engine.on_fill
 
-    if not live:
-        print(f"Paper trading {config.PAIR} over WebSocket | starting equity: {portfolio.cash:.2f}")
-        if demo:
-            print(
-                f"[DEMO MODE] thresholds loosened to {rsi_oversold}/{rsi_overbought} so a signal "
-                "fires sooner. Still 100% simulated, using a separate demo_ state file."
-            )
-        print("No real orders will be placed. Press Ctrl+C to stop.\n")
-
+    tasks = [asyncio.create_task(md.run(engine)), asyncio.create_task(periodic(engine, metrics, config.STATS_INTERVAL_S))]
+    if live:
+        tasks.append(asyncio.create_task(gateway.run()))
     try:
-        async for event in stream_ohlc(config.WS_SYMBOL, interval_minutes):
-            price = event["price"]
-
-            if not event["new_candle"]:
-                timestamp = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%H:%M:%S")
-                print(
-                    f"\r{timestamp} live price={price:.2f} equity={portfolio.equity(price):.2f}   ",
-                    end="",
-                    flush=True,
-                )
-                continue
-
-            closed_price = event["closed_price"]
-            closes.append(closed_price)
-            closes = closes[-HISTORY_LIMIT:]
-
-            rsi = compute_rsi(closes, config.RSI_PERIOD)
-            signal = generate_signal(rsi, portfolio.has_position(), rsi_oversold, rsi_overbought)
-            # signal = generate_signal(portfolio.has_position())
-
-            if signal == "BUY":
-                spend = calculate_spend(portfolio, closed_price, config)
-                qty = portfolio.buy(closed_price, spend, config.KRAKEN_TAKER_FEE)
-                if qty is not None:
-                    print(f"\n[TRADE] BUY {qty:.6f} {config.PAIR} @ {closed_price:.2f} (spent {spend:.2f})")
-            elif signal == "SELL":
-                qty = portfolio.sell(closed_price, config.KRAKEN_TAKER_FEE)
-                if(qty is not None):
-                    print(f"\n[TRADE] SELL {qty:.6f} {config.PAIR} @ {closed_price:.2f}")
-
-            portfolio.save()
-
-            rsi_display = f"{rsi:.1f}" if rsi is not None else "n/a"
-            timestamp = datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d %H:%M:%S")
-            print(
-                f"\n{timestamp} | candle close={closed_price:.2f} rsi={rsi_display} "
-                f"cash={portfolio.cash:.2f} position={portfolio.position_qty:.6f} "
-                f"equity={portfolio.equity(closed_price):.2f}"
-            )
+        await asyncio.gather(*tasks)
     finally:
-        portfolio.save()
+        for t in tasks:
+            t.cancel()
         if live:
-            print(f"Realized loss this session: {portfolio.realized_loss:.2f} (cap {config.LIVE_MAX_LOSS_USD:.2f})")
-            print("\nStopped. Live balance is whatever Kraken currently shows -- no local state to lose.")
-        else:
-            print("Profit: ", portfolio.profit)
-            print("\nStopped. Portfolio state saved.")
+            await gateway.shutdown()
+        mark = md.book.mid() if md.book.is_ready() else 0.0
+        print(
+            f"\n\nStopped. fills={position.fills} volume=${position.volume_usd:.2f} "
+            f"fees=${position.fees:.4f} position={position.qty:.8f} pnl={position.pnl(mark):+.4f}"
+        )
+        print(metrics.report())
+        if live and position.qty > 0:
+            print(f"[LIVE] Still holding {position.qty:.8f} bought by the bot -- flatten manually if desired.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--demo",
-        action="store_true",
-        help="Use 1-minute candles and loosened RSI thresholds (45/55) so a "
-        "simulated buy/sell fires within minutes instead of waiting for a real "
-        "oversold/overbought swing. Still paper trading, using separate demo_ state files.",
-    )
+    parser = argparse.ArgumentParser(description="Low-latency Kraken market maker")
     parser.add_argument(
         "--live",
         action="store_true",
-        help="Trade with REAL MONEY on Kraken. Requires LIVE_TRADING_CONFIRMED=yes "
-        "in the environment. Incompatible with --demo.",
+        help="Quote with REAL MONEY via Kraken's authenticated WebSocket. "
+        "Requires LIVE_TRADING_CONFIRMED=yes and KRAKEN_API_KEY/KRAKEN_API_SECRET.",
     )
     parser.add_argument(
-        "--live-test",
-        action="store_true",
-        help="Place one minimum-size real buy then immediately sell it back, to "
-        "validate credentials/permissions/fill-handling before running --live "
-        "unattended. Also requires LIVE_TRADING_CONFIRMED=yes.",
+        "--record",
+        metavar="FILE",
+        help="Append every raw market data message (with receive time) to FILE "
+        "for offline replay with replay.py.",
     )
     args = parser.parse_args()
 
-    if args.live and args.demo:
-        sys.exit("--live and --demo are mutually exclusive.")
+    try:
+        import uvloop  # Linux/macOS only; a faster drop-in event loop
+        uvloop.install()
+    except ImportError:
+        pass
 
-    if args.live_test:
-        confirm_live_trading()
-        run_live_test(KrakenAPI(), config)
-    else:
-        try:
-            asyncio.run(run(demo=args.demo, live=args.live))
-        except KeyboardInterrupt:
-            pass
+    try:
+        asyncio.run(run(live=args.live, record_path=args.record))
+    except KeyboardInterrupt:
+        pass

@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+*.jsonl
+*trades_log.csv

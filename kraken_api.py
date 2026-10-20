@@ -17,11 +17,10 @@ class KrakenAPIError(Exception):
 class KrakenAPI:
     """Thin wrapper around Kraken's REST API.
 
-    Public endpoints (OHLC, ticker) need no credentials, which is all
-    paper trading uses. Private endpoints are included for when this
-    is later switched to live trading, reading credentials from
-    environment variables (KRAKEN_API_KEY / KRAKEN_API_SECRET) rather
-    than hardcoding them.
+    Only used at startup (instrument metadata, balances, the WebSocket
+    auth token) -- all market data and order entry goes over WebSockets.
+    Credentials come from KRAKEN_API_KEY / KRAKEN_API_SECRET, never
+    hardcoded; paper trading needs none.
     """
 
     def __init__(self, api_key=None, api_secret=None):
@@ -72,14 +71,6 @@ class KrakenAPI:
             return float(info["c"][0])
         raise KrakenAPIError(f"No ticker data returned for pair {pair}")
 
-    def add_order(self, pair, side, volume, order_type="market", validate=False):
-        """Places a REAL order on Kraken. Not used in paper-trading mode.
-        validate=True asks Kraken to check the order without executing it."""
-        data = {"pair": pair, "type": side, "ordertype": order_type, "volume": str(volume)}
-        if validate:
-            data["validate"] = "true"
-        return self._private_request("/0/private/AddOrder", data)
-
     def get_balance(self):
         """Wraps the private Balance endpoint. Returns {asset_code: amount}."""
         result = self._private_request("/0/private/Balance")
@@ -97,10 +88,12 @@ class KrakenAPI:
                 "ordermin": float(info.get("ordermin", 0)),
                 "costmin": float(info.get("costmin", 0)),
                 "lot_decimals": int(info.get("lot_decimals", 8)),
+                "pair_decimals": int(info.get("pair_decimals", 1)),
+                "tick_size": float(info.get("tick_size") or 10 ** -int(info.get("pair_decimals", 1))),
             }
         raise KrakenAPIError(f"No asset pair info returned for {pair}")
 
-    def query_order(self, txid):
-        """Wraps the private QueryOrders endpoint for a single order id."""
-        result = self._private_request("/0/private/QueryOrders", {"txid": txid})
-        return result.get(txid)
+    def get_ws_token(self):
+        """Short-lived token that authenticates the private WebSocket (order
+        entry + executions). Fetched once per connection, outside the hot path."""
+        return self._private_request("/0/private/GetWebSocketsToken")["token"]
